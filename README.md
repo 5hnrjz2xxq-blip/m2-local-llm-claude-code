@@ -15,6 +15,7 @@
 5. [常用命令速查](#5-常用命令速查)
 6. [回滚与恢复](#6-回滚与恢复)
 7. [速度优化（thinking 模型加速）](#7-速度优化thinking-模型加速)
+8. [MCP 工具按需加载（Tool Search，解决大请求体超时）](#8-mcp-工具按需加载tool-search解决大请求体超时)
 
 ---
 
@@ -25,12 +26,17 @@
 | 推理服务器 | **LM Studio 0.4.24** | 自带 llama.cpp / MLX 双引擎，本地 API 服务 |
 | 模型 | **Qwen3.5-9B-Q4_K_M（GGUF，unsloth 版）** | 9B 参数、多模态、代码/推理能力均衡，Q4_K_M 量化 5.68GB |
 | 引擎 | **llama.cpp**（GGUF 走此引擎） | 上下文长度可自由控制 |
-| 上下文 | **65536（64K）** | Claude Code 完整请求约 4.7 万 tokens，32K 装不下 |
-| API 端点 | `http://127.0.0.1:1235`（API 代理）→ `1234`（LM Studio） | 代理自动注入 `reasoningBudget`，thinking 模型速度提升 30+ 倍 |
+| 上下文 | **65536（64K）**，`--parallel 1` 单槽 | Claude Code 完整请求约 4.7 万 tokens，32K 装不下；单槽最省内存、最稳定 |
+| API 端点 | `http://127.0.0.1:1235`（API 代理）→ `1234`（LM Studio） | 代理负责请求体兼容转换 + 强制流式 + 注入 `reasoningBudget=500` |
+| MCP 工具 | **Tool Search 按需加载**（`ENABLE_TOOL_SEARCH=true`） | 启动只加载 9 个核心工具，MCP 工具用到才搜索，请求体 92KB→44KB |
+| 超时 | **600 秒**（`CLAUDE_CODE_API_TIMEOUT_MS=600000`） | 本地大模型 prefill 慢，需放宽超时 |
 | 切换工具 | **CC-Switch** | 管理 Claude Code 的供应商切换 |
 | 自动加载 | **macOS LaunchAgent ×2** | LM Studio 重启后自动按 64K 加载模型 + API 代理开机自启 |
 
-**性能实测**：约 10.7 tok/s（M2 Air，16GB 统一内存，模型常驻 5.29GiB）。
+**性能实测（M2 Air 16GB，模型常驻 5.29GiB）**：
+- 生成速度约 10.7 tok/s；
+- 简单问答约 20–70 秒（首个请求含 prefill 偏慢）；
+- 复杂代码（带工具定义的完整请求，如快速排序）约 105 秒，结果正确。
 
 ---
 
@@ -135,13 +141,17 @@ python3 scripts/patch_qwen35_template.py
 >
 > 参考 GGUF 类型表（手写解析用）：`0=UINT8 1=INT8 2=UINT16 3=INT16 4=UINT32 5=INT32 6=FLOAT32 7=BOOL 8=STRING 9=ARRAY 10=UINT64 11=INT64 12=FLOAT64`。GGUFReader 的 `field.offset` 指向 kv 条目起始，可直接据此解析字符串数据偏移。
 
-### 3.6 加载模型（64K 上下文）
+### 3.6 加载模型（64K 上下文，单槽）
 
 ```bash
 "$LMS" unload qwen3.5-9b
-"$LMS" load qwen3.5-9b -c 65536 -y
-"$LMS" ps   # 确认 CONTEXT=65536
+"$LMS" load qwen3.5-9b -c 65536 --parallel 1 -y
+"$LMS" ps   # 确认 CONTEXT=65536、PARALLEL=1
 ```
+
+> `--parallel 1` 只开一个推理槽，最省 KV cache 内存，在 16GB 机器上最稳定；多槽（parallel=4）会额外占用数 GB，反而容易因内存压力导致请求返回空响应。
+>
+> 若 `lms load` 报 `insufficient system resources`，是 LM Studio 的加载护栏（`modelLoadingGuardrails`）拦截；可在 `~/.cache/lm-studio/settings.json` 把护栏模式调低，或先 `lms unload --all` 释放内存再加载。
 
 ### 3.7 配置 CC-Switch
 
@@ -194,6 +204,11 @@ launchctl load ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist
 |---|---|---|
 | `Jinja Exception: System message must be at the beginning` | Qwen3.5 模板强制 system 开头，Claude Code 多轮在中间插 system | 修改 GGUF 内嵌模板（见 3.5） |
 | `request (47007 tokens) exceeds the available context size (32768)` | Claude Code 完整请求约 4.7 万 tokens，32K 不够 | 64K 上下文加载（见 3.6） |
+| 大请求（带几十个工具定义）返回 HTTP 200 但**空响应体**，之后所有请求都挂 | ① 请求体过大 prefill 时间过长/内存压力；② Claude Code 原始请求体含 LM Studio 不支持的字段（`cache_control`/`thinking`/多块 content 等） | 代理做请求体兼容转换 + Tool Search 缩减工具数（见第 8 节） |
+| `lms load` 报 `insufficient system resources` | LM Studio 加载护栏 + 16GB 内存紧张，旧实例未释放 | `lms unload --all` 后再加载；调低 `modelLoadingGuardrails`；用 `--parallel 1` |
+| 每次加载模型都自动多出一个 `:2` 旧实例（64K/parallel=4） | LaunchAgent 自动加载脚本与手动加载冲突，或 LM Studio 恢复上次实例 | 统一自动加载脚本参数（64K + parallel 1）；`lms unload --all` 后只留一个实例 |
+| 简单 curl 正常，Claude Code 却 `socket hang up` / 空响应 | 代理 keep-alive 复用了被服务端关闭的连接；且未强制 `stream=true` | 代理用 `Connection: close`、每请求新建连接、强制 `stream=true`（见 7.2 / 第 8 节） |
+| 1234 端口突然 HTTP 000，但 llama-server 进程还在（监听随机端口） | LM Studio 的外层 API 服务（1234）掉线，后端 llama-server 没挂 | `lms server start --port 1234` 重新拉起 |
 | MLX 版 CONTEXT 始终 13568，`-c 32768` 无效 | MLX 引擎 auto-fit 硬算（差 0.02GiB 被拒），本机 mlx-llm 1.11.0 无关闭开关 | 改用 GGUF + llama.cpp 引擎 |
 | 下载时系统整体卡死（Bash/GUI 全超时约半小时） | MLX 模型 7.12GB 常驻 + 大文件下载 + 其他应用，内存耗尽 | 卸载 MLX 模型后再下载；下载后删除 MLX 模型目录释放 11GB |
 | LM Studio GUI 无法自动化（AX 树只有菜单栏） | Electron 应用窗口对 macOS AX 不可见 | 全部改用 lms CLI 操作 |
@@ -211,7 +226,7 @@ launchctl load ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist
 LMS="/Applications/LM Studio.app/Contents/Resources/app/.webpack/lms"
 
 "$LMS" server start --port 1234   # 启动服务
-"$LMS" load qwen3.5-9b -c 65536 -y   # 加载模型（64K）
+"$LMS" load qwen3.5-9b -c 65536 --parallel 1 -y   # 加载模型（64K 单槽）
 "$LMS" unload qwen3.5-9b          # 卸载模型
 "$LMS" ps                         # 查看加载状态（CONTEXT 列确认上下文）
 "$LMS" ls                         # 列出已下载模型
@@ -254,10 +269,10 @@ Qwen3.5-9B（unsloth GGUF 版）是 **thinking 版模型**——每次回答前�
 
 LM Studio 的 Anthropic 兼容端点（`/v1/messages`）支持 `reasoningBudget` 参数，可限制思考 tokens 上限。但 Claude Code 不会自动传这个参数。
 
-**写一个 Node.js API 代理**，监听 `127.0.0.1:1235`，转发到 LM Studio（`1234`），自动给所有 `/v1/messages` POST 请求注入 `"reasoningBudget": 500`。
+**写一个 Node.js API 代理**，监听 `127.0.0.1:1235`，转发到 LM Studio（`1234`），自动给所有 `/v1/messages` POST 请求注入 `"reasoningBudget": 500`，并做请求体兼容转换（详见第 8 节）。
 
 ```
-Claude Code → http://127.0.0.1:1235（代理，自动注入 reasoningBudget=500）→ http://127.0.0.1:1234（LM Studio）
+Claude Code → http://127.0.0.1:1235（代理，兼容转换 + reasoningBudget=500）→ http://127.0.0.1:1234（LM Studio）
 ```
 
 ### 7.3 效果
@@ -265,7 +280,7 @@ Claude Code → http://127.0.0.1:1235（代理，自动注入 reasoningBudget=50
 | 场景 | 无代理 | 有代理（reasoningBudget=500） | 提升 |
 |---|---|---|---|
 | 简单问题（1+1=几） | 204 秒 | 5.7 秒 | **36 倍** |
-| 复杂代码（快速排序） | — | 8.5 秒 | — |
+| 复杂代码（快速排序） | — | 8.5 秒（精简请求）/ 约 105 秒（完整工具集） | — |
 | API 直连（简单问题） | 214 秒 | 0.67 秒 | **300 倍** |
 
 代码精度完好（快速排序函数正确输出）。
@@ -301,10 +316,92 @@ launchctl load ~/Library/LaunchAgents/com.user.lmstudio-api-proxy.plist
 |---|---|
 | MTP 投机解码（`--speculative-draft-mtp`） | ❌ unsloth 量化版无 MTP head |
 | 简单投机解码（额外 draft 模型） | ❌ 16GB 装不下两个模型 |
-| `--parallel 1`（单用户优化） | ❌ 导致 HTTP 000 不稳定 |
 | `--gpu max`（强制全 GPU） | ❌ 导致不稳定 |
 | settings.json 全局 `reasoningBudget` | ❌ 扁平键不被识别，需代理注入 |
 | KV cache 量化（q8_0） | ⚠️ 配置未生效（日志无 q8_0 信息），影响有限 |
+
+> 注：`--parallel 1` **不是**不稳定因素，反而是 16GB 机器的最终稳定选择。早期观察到的「parallel 1 出问题」实际是「自动加载脚本又拉起一个 :2 旧实例 + 请求体不兼容」共同导致，解决这两点后 parallel 1 稳定运行。
+
+---
+
+## 8. MCP 工具按需加载（Tool Search，解决大请求体超时）
+
+### 8.1 问题：带完整工具定义的大请求必然超时
+
+Claude Code 默认把**全部工具定义**（内置工具 + 所有已连接 MCP server 的工具）塞进每次请求。本机实测：
+
+- 内置工具 27 个 ≈ 74KB，MCP 工具 29 个（openfinclaw 21 + skills 8）≈ 13KB，system ≈ 6KB，合计请求体约 92–94KB；
+- 9B 本地模型 prefill 这么大的输入极慢，实测工具数量与耗时关系：
+
+| 工具数 | 请求体 | 结果（64K） |
+|---|---|---|
+| 0 | 6KB | 成功，约 48 秒 |
+| 5 | 21KB | 成功，约 100 秒 |
+| 10 | 33KB | 120 秒超时（已有部分输出） |
+| 56（全量） | 94KB | 超时 / 空响应 |
+
+### 8.2 方案：强制开启 Tool Search
+
+Claude Code 内置 **Tool Search**：会话启动时只加载少量核心工具和一个 `ToolSearch` 工具，**MCP 工具只登记名字、不加载完整定义**；模型判断需要某个 MCP 工具时才调用 `ToolSearch` 按需拉取。
+
+**关键坑**：当 `ANTHROPIC_BASE_URL` 指向非官方地址（本地代理）时，Tool Search 会被**默认关闭**，必须在 `~/.claude/settings.json` 的 `env` 里显式强制开启：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:1235",
+    "ANTHROPIC_AUTH_TOKEN": "lmstudio",
+    "ANTHROPIC_MODEL": "qwen3.5-9b",
+    "ENABLE_TOOL_SEARCH": "true",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
+    "CLAUDE_CODE_API_TIMEOUT_MS": "600000"
+  }
+}
+```
+
+效果：启动加载工具数 **56 → 9**（Agent/AskUserQuestion/Bash/Edit/Read/Skill/ToolSearch/Workflow/Write），请求体 **92KB → 44KB（-52%）**，复杂代码请求从「必超时」变为「约 105 秒成功」。
+
+> `ENABLE_TOOL_SEARCH` 取值：`true` 全部延迟（本机用这个）；`auto` 工具定义占上下文 <10% 时全量、超出才延迟；`false` 全量加载。
+
+### 8.3 代理侧的请求体兼容转换（必须配合）
+
+光开 Tool Search 还不够，Claude Code 的原始请求体仍含 LM Studio 不认识的字段。代理（`scripts/lmstudio-api-proxy.js`）对每个 `/v1/messages` 请求做：
+
+1. 递归删除 `cache_control`；
+2. 删除顶层 `thinking` / `context_management` / `output_config` / `metadata`；
+3. **强制 `stream=true`**（Claude Code 原始请求可能不带，缺了会返回空响应）；
+4. **覆盖 `reasoningBudget=500`**；
+5. 把数组形式的 `system` 和 `messages[].content` 扁平化为纯字符串，移除消息列表里的 `system` 角色消息；
+6. 请求头用 `Connection: close`（避免 keep-alive 复用已关闭连接导致 `socket hang up`），剔除 `accept-encoding`、`anthropic-beta`。
+
+### 8.4 MCP 工具的三种灵活管理方式
+
+**方式一：Tool Search 自动按需（推荐，已启用）**——见 8.2，无需手动干预。
+
+**方式二：会话内 `/mcp` 面板手动开关**
+
+```text
+/mcp                      # 查看所有 MCP server 状态与工具数
+/mcp disable openfinclaw  # 本次会话关闭金融工具（21 个）
+/mcp enable openfinclaw   # 需要时再开
+/mcp reconnect <server>   # 断线重连
+```
+
+**方式三：按场景用独立配置启动**
+
+```bash
+claude --mcp-config ~/.mcp-coding.json --strict-mcp-config   # 只加载该文件里的 MCP
+```
+
+### 8.5 关闭某个 MCP server 到底能提升多少
+
+Tool Search 已让 MCP 工具定义**不进初始请求体**，所以禁用某个 MCP server **不提升 token/prefill 速度**；收益仅在：
+
+- **内存**：每个 stdio 型 MCP server 是常驻 node 进程，本机实测 openfinclaw ≈ 63MB、claude-code-skills ≈ 148MB；
+- **启动时间**：少拉起一个进程，会话启动快 1–3 秒；
+- **搜索精度**：ToolSearch 候选更少、更聚焦。
+
+在 16GB 紧张内存下，用不到的 MCP（如纯写代码时的金融工具 openfinclaw）建议用 `/mcp disable` 或从 `enabledMcpjsonServers` 移除。
 
 ---
 
