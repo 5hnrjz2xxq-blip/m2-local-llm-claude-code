@@ -2,7 +2,7 @@
 
 > MacBook Air M2（16GB / 256GB，10+10 核）上，用 LM Studio 跑本地模型，并完整接入 VS Code 的 Claude Code（通过 CC-Switch 管理切换，走国内镜像）。
 
-**成果**：Claude Code 通过本地模型完成「创建文件 → 运行 → 读取输出」的多轮工具调用闭环，无需联网 API。
+**成果**：Claude Code 通过本地模型完成「创建文件 → 运行 → 读取输出」的多轮工具调用闭环，无需联网 API；同一模型也可通过 1236 桥接接入小米 MiMo 等 OpenAI 格式客户端。
 
 ---
 
@@ -16,6 +16,7 @@
 6. [回滚与恢复](#6-回滚与恢复)
 7. [速度优化（thinking 模型加速）](#7-速度优化thinking-模型加速)
 8. [MCP 工具按需加载（Tool Search，解决大请求体超时）](#8-mcp-工具按需加载tool-search解决大请求体超时)
+9. [接入 OpenAI 格式客户端（小米 MiMo 等）：1236 桥接](#9-接入-openai-格式客户端小米-mimo-等1236-桥接)
 
 ---
 
@@ -28,14 +29,15 @@
 | 引擎 | **llama.cpp**（GGUF 走此引擎） | 上下文长度可自由控制 |
 | 上下文 | **65536（64K）**，`--parallel 1` 单槽 | Claude Code 完整请求约 4.7 万 tokens，32K 装不下；单槽最省内存、最稳定 |
 | API 端点 | `http://127.0.0.1:1235`（API 代理）→ `1234`（LM Studio） | 代理负责请求体兼容转换 + 强制流式 + 注入 `reasoningBudget=500` |
+| OpenAI 客户端 | `http://127.0.0.1:1236/v1`（协议桥接）→ `1234` | 给小米 MiMo 等只支持 OpenAI 协议的客户端，详见第 9 节 |
 | MCP 工具 | **Tool Search 按需加载**（`ENABLE_TOOL_SEARCH=true`） | 启动只加载 9 个核心工具，MCP 工具用到才搜索，请求体 92KB→44KB |
 | 超时 | **600 秒**（`CLAUDE_CODE_API_TIMEOUT_MS=600000`） | 本地大模型 prefill 慢，需放宽超时 |
 | 切换工具 | **CC-Switch** | 管理 Claude Code 的供应商切换 |
-| 自动加载 | **macOS LaunchAgent ×2** | LM Studio 重启后自动按 64K 加载模型 + API 代理开机自启 |
+| 自动加载 | **macOS LaunchAgent ×3** | 模型自动按 64K 加载 + 1235 代理 + 1236 桥接，均开机自启 |
 
 **性能实测（M2 Air 16GB，模型常驻 5.29GiB）**：
 - 生成速度约 10.7 tok/s；
-- 简单问答约 20–70 秒（首个请求含 prefill 偏慢）；
+- 简单问答约 1–5 秒（经代理限制思考后）；
 - 复杂代码（带工具定义的完整请求，如快速排序）约 105 秒，结果正确。
 
 ---
@@ -159,7 +161,7 @@ python3 scripts/patch_qwen35_template.py
 
 - **名称**：`LM Studio 本地`
 - **类型**：Claude Code
-- **Base URL**：`http://127.0.0.1:1234`
+- **Base URL**：`http://127.0.0.1:1235`（走兼容代理，不是 1234）
 - **API Key**：任意非空（如 `lm-studio`）
 - **模型名**：`qwen3.5-9b`（对应 `ANTHROPIC_MODEL / HAIKU / SONNET / OPUS` 四档）
 
@@ -205,9 +207,11 @@ launchctl load ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist
 | `Jinja Exception: System message must be at the beginning` | Qwen3.5 模板强制 system 开头，Claude Code 多轮在中间插 system | 修改 GGUF 内嵌模板（见 3.5） |
 | `request (47007 tokens) exceeds the available context size (32768)` | Claude Code 完整请求约 4.7 万 tokens，32K 不够 | 64K 上下文加载（见 3.6） |
 | 大请求（带几十个工具定义）返回 HTTP 200 但**空响应体**，之后所有请求都挂 | ① 请求体过大 prefill 时间过长/内存压力；② Claude Code 原始请求体含 LM Studio 不支持的字段（`cache_control`/`thinking`/多块 content 等） | 代理做请求体兼容转换 + Tool Search 缩减工具数（见第 8 节） |
+| OpenAI 客户端直连 1234 收到空回复 | thinking 模型在 `/v1/chat/completions` 思考后断流，控制参数不生效 | 走 1236 桥接转 `/v1/messages`（见第 9 节） |
 | `lms load` 报 `insufficient system resources` | LM Studio 加载护栏 + 16GB 内存紧张，旧实例未释放 | `lms unload --all` 后再加载；调低 `modelLoadingGuardrails`；用 `--parallel 1` |
 | 每次加载模型都自动多出一个 `:2` 旧实例（64K/parallel=4） | LaunchAgent 自动加载脚本与手动加载冲突，或 LM Studio 恢复上次实例 | 统一自动加载脚本参数（64K + parallel 1）；`lms unload --all` 后只留一个实例 |
 | 简单 curl 正常，Claude Code 却 `socket hang up` / 空响应 | 代理 keep-alive 复用了被服务端关闭的连接；且未强制 `stream=true` | 代理用 `Connection: close`、每请求新建连接、强制 `stream=true`（见 7.2 / 第 8 节） |
+| parallel=1 时上一请求刚结束就发新请求被瞬时 400/abort | 单槽槽位尚未释放 | 桥接/客户端自动重试一次，间隔 1.2 秒 |
 | 1234 端口突然 HTTP 000，但 llama-server 进程还在（监听随机端口） | LM Studio 的外层 API 服务（1234）掉线，后端 llama-server 没挂 | `lms server start --port 1234` 重新拉起 |
 | MLX 版 CONTEXT 始终 13568，`-c 32768` 无效 | MLX 引擎 auto-fit 硬算（差 0.02GiB 被拒），本机 mlx-llm 1.11.0 无关闭开关 | 改用 GGUF + llama.cpp 引擎 |
 | 下载时系统整体卡死（Bash/GUI 全超时约半小时） | MLX 模型 7.12GB 常驻 + 大文件下载 + 其他应用，内存耗尽 | 卸载 MLX 模型后再下载；下载后删除 MLX 模型目录释放 11GB |
@@ -225,27 +229,30 @@ launchctl load ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist
 ```bash
 LMS="/Applications/LM Studio.app/Contents/Resources/app/.webpack/lms"
 
-"$LMS" server start --port 1234   # 启动服务
+"$LMS" server start --port 1234        # 启动服务
 "$LMS" load qwen3.5-9b -c 65536 --parallel 1 -y   # 加载模型（64K 单槽）
-"$LMS" unload qwen3.5-9b          # 卸载模型
-"$LMS" ps                         # 查看加载状态（CONTEXT 列确认上下文）
-"$LMS" ls                         # 列出已下载模型
+"$LMS" unload qwen3.5-9b               # 卸载模型
+"$LMS" ps                              # 查看加载状态（CONTEXT 列确认上下文）
+"$LMS" ls                              # 列出已下载模型
+
+# 三个本地端点：1234 原生 / 1235 Claude Code(Anthropic) / 1236 OpenAI 客户端
+launchctl list | grep lmstudio         # 查看三个 LaunchAgent 是否在跑
 ```
 
 **API 测试**：
 
 ```bash
-# OpenAI 兼容
-curl http://127.0.0.1:1234/v1/chat/completions \
+# OpenAI 兼容（经 1236 桥接，MiMo 走这个）
+curl http://127.0.0.1:1236/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"你好"}]}'
 
-# Anthropic 兼容（Claude Code 走这个）
+# Anthropic 兼容（Claude Code 经 1235 走这个）
 curl http://127.0.0.1:1234/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: lm-studio" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"qwen3.5-9b","max_tokens":1024,"stream":true,"reasoningBudget":500,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ---
@@ -255,7 +262,7 @@ curl http://127.0.0.1:1234/v1/messages \
 - **模型模板**：`scripts/patch_qwen35_template.py` 运行前会备份原文件为 `.orig.bak`；如需还原：`mv Qwen3.5-9B-Q4_K_M.gguf.orig.bak Qwen3.5-9B-Q4_K_M.gguf`。
 - **CC-Switch 配置**：数据库备份在 `~/.cc-switch/cc-switch.db.bak-*`。
 - **Claude 配置**：原配置备份在 `~/.claude/settings.json.bak-glm`。
-- **停用自动加载**：`launchctl unload ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist`
+- **停用自启服务**：对对应 plist 执行 `launchctl unload ~/Library/LaunchAgents/com.user.lmstudio-*.plist`。
 
 ---
 
@@ -279,9 +286,8 @@ Claude Code → http://127.0.0.1:1235（代理，兼容转换 + reasoningBudget=
 
 | 场景 | 无代理 | 有代理（reasoningBudget=500） | 提升 |
 |---|---|---|---|
-| 简单问题（1+1=几） | 204 秒 | 5.7 秒 | **36 倍** |
-| 复杂代码（快速排序） | — | 8.5 秒（精简请求）/ 约 105 秒（完整工具集） | — |
-| API 直连（简单问题） | 214 秒 | 0.67 秒 | **300 倍** |
+| 简单问题（1+1=几） | 204 秒 | 1–5 秒 | **数十倍** |
+| 复杂代码（快速排序，完整工具集） | 必超时 | 约 105 秒（配合 Tool Search） | 从不可用→可用 |
 
 代码精度完好（快速排序函数正确输出）。
 
@@ -402,6 +408,67 @@ Tool Search 已让 MCP 工具定义**不进初始请求体**，所以禁用某�
 - **搜索精度**：ToolSearch 候选更少、更聚焦。
 
 在 16GB 紧张内存下，用不到的 MCP（如纯写代码时的金融工具 openfinclaw）建议用 `/mcp disable` 或从 `enabledMcpjsonServers` 移除。
+
+---
+
+## 9. 接入 OpenAI 格式客户端（小米 MiMo 等）：1236 桥接
+
+### 9.1 为什么不能让这类客户端直连 1234
+
+Claude Code 走 Anthropic 协议（`/v1/messages`），用 1235 代理。但很多桌面客户端（小米 MiMo、ChatBox、NextChat 等）的「自定义模型」只支持 **OpenAI 协议**（接口地址填到 `/v1`，实际请求 `/v1/chat/completions`）。
+
+本机这个已 patch 的 thinking 模型在 LM Studio 上有个坑：
+
+| 端点 | 协议 | 表现 |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI | ❌ 思考中途断流、正文为空；`reasoningBudget` / `enable_thinking` 均不生效 |
+| `/v1/messages` | Anthropic | ✅ 加 `reasoningBudget=500` 后稳定快速（0.3–4 秒出正文） |
+
+所以 OpenAI 格式客户端**直连 1234 会一直收到空回复**，需要一个协议转换桥接。
+
+### 9.2 桥接架构
+
+```
+OpenAI 客户端(MiMo)
+   │  POST /v1/chat/completions (OpenAI 格式)
+   ▼
+1236  lmstudio-openai-bridge.js   ← OpenAI→Anthropic 转换，注入 reasoningBudget=500
+   │  POST /v1/messages (Anthropic 格式，始终流式)
+   ▼
+1234  LM Studio → Qwen3.5-9B
+```
+
+桥接做的事：
+1. 把 OpenAI 的 `messages`（含 `system` 角色）转成 Anthropic 格式（system 抽成独立字段）；
+2. 到上游**始终走流式**（唯一稳定路径），注入 `reasoningBudget=500`，丢弃 thinking 内容只回正文；
+3. 把 Anthropic SSE 事件转回 OpenAI `chat.completion.chunk`；客户端要非流式就本地聚合后返回完整 JSON；
+4. **空响应 / 上游瞬时 400、aborted 自动重试一次**（parallel=1 单槽在上一请求刚结束时会短暂拒绝新请求）；
+5. `GET /v1/models` 直接透传，方便客户端拉模型列表。
+
+### 9.3 部署（已配成开机自启）
+
+```bash
+cp scripts/lmstudio-openai-bridge.js ~/bin/
+cp scripts/com.user.lmstudio-openai-bridge.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.user.lmstudio-openai-bridge.plist
+# 日志：~/.cache/lm-studio/openai-bridge.log
+```
+
+### 9.4 客户端界面填写（以小米 MiMo「添加模型 → 自定义/Custom」为例）
+
+| 字段 | 填写值 |
+|---|---|
+| 提供商 | 自定义 / Custom |
+| 接口地址 | `http://127.0.0.1:1236/v1` |
+| API Key | `lm-studio`（任意非空即可） |
+| 模型名称 | `qwen3.5-9b`（必须与 `lms ps` 的 IDENTIFIER 完全一致） |
+| 图片输入 | **不勾**（当前 GGUF 未带 mmproj 视觉投影文件，纯文本） |
+| 输入上限 | `64K`（与模型加载的 65536 对齐） |
+| 输出上限 | `8K`（够用即可；thinking 会先占一部分额度，别选太小，否则正文被截断） |
+
+> 注意接口地址带 `/v1`、**不带** `/chat/completions`（客户端会自己拼）。
+>
+> 三套端点区分：**1234** = LM Studio 原生（调试用）；**1235** = 给 Claude Code 的 Anthropic 兼容代理；**1236** = 给 OpenAI 格式客户端的桥接。
 
 ---
 
