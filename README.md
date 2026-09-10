@@ -14,6 +14,7 @@
 4. [关键排坑记录](#4-关键排坑记录)
 5. [常用命令速查](#5-常用命令速查)
 6. [回滚与恢复](#6-回滚与恢复)
+7. [速度优化（thinking 模型加速）](#7-速度优化thinking-模型加速)
 
 ---
 
@@ -25,9 +26,9 @@
 | 模型 | **Qwen3.5-9B-Q4_K_M（GGUF，unsloth 版）** | 9B 参数、多模态、代码/推理能力均衡，Q4_K_M 量化 5.68GB |
 | 引擎 | **llama.cpp**（GGUF 走此引擎） | 上下文长度可自由控制 |
 | 上下文 | **65536（64K）** | Claude Code 完整请求约 4.7 万 tokens，32K 装不下 |
-| API 端点 | `http://127.0.0.1:1234` | OpenAI 兼容 + Anthropic 兼容（`/v1/messages`） |
+| API 端点 | `http://127.0.0.1:1235`（API 代理）→ `1234`（LM Studio） | 代理自动注入 `reasoningBudget`，thinking 模型速度提升 30+ 倍 |
 | 切换工具 | **CC-Switch** | 管理 Claude Code 的供应商切换 |
-| 自动加载 | **macOS LaunchAgent** | LM Studio 重启后自动按 64K 加载模型 |
+| 自动加载 | **macOS LaunchAgent ×2** | LM Studio 重启后自动按 64K 加载模型 + API 代理开机自启 |
 
 **性能实测**：约 10.7 tok/s（M2 Air，16GB 统一内存，模型常驻 5.29GiB）。
 
@@ -130,7 +131,7 @@ python3 scripts/patch_qwen35_template.py
 4. 用 jinja 注释等长填充到原长度，原位写回；
 5. 重新读取验证。
 
-> 注意：LM Studio 的外部 `chat_template.jinja` 文件对 GGUF 模型不生效（llama.cpp 引擎只用 GGUF 内嵌模板），所以必须改文件本身。
+> 注意：LLM Studio 的外部 `chat_template.jinja` 文件对 GGUF 模型不生效（llama.cpp 引擎只用 GGUF 内嵌模板），所以必须改文件本身。
 >
 > 参考 GGUF 类型表（手写解析用）：`0=UINT8 1=INT8 2=UINT16 3=INT16 4=UINT32 5=INT32 6=FLOAT32 7=BOOL 8=STRING 9=ARRAY 10=UINT64 11=INT64 12=FLOAT64`。GGUFReader 的 `field.offset` 指向 kv 条目起始，可直接据此解析字符串数据偏移。
 
@@ -240,6 +241,70 @@ curl http://127.0.0.1:1234/v1/messages \
 - **CC-Switch 配置**：数据库备份在 `~/.cc-switch/cc-switch.db.bak-*`。
 - **Claude 配置**：原配置备份在 `~/.claude/settings.json.bak-glm`。
 - **停用自动加载**：`launchctl unload ~/Library/LaunchAgents/com.user.lmstudio-autoload.plist`
+
+---
+
+## 7. 速度优化（thinking 模型加速）
+
+### 7.1 问题：thinking 版模型速度极慢
+
+Qwen3.5-9B（unsloth GGUF 版）是 **thinking 版模型**——每次回答前会先输出几百到几千个思考 tokens，然后才输出最终答案。实测简单问题"1+1=几"耗时 **204 秒**（模型思考了约 2000+ tokens）。
+
+### 7.2 解决方案：API 代理自动注入 `reasoningBudget`
+
+LM Studio 的 Anthropic 兼容端点（`/v1/messages`）支持 `reasoningBudget` 参数，可限制思考 tokens 上限。但 Claude Code 不会自动传这个参数。
+
+**写一个 Node.js API 代理**，监听 `127.0.0.1:1235`，转发到 LM Studio（`1234`），自动给所有 `/v1/messages` POST 请求注入 `"reasoningBudget": 500`。
+
+```
+Claude Code → http://127.0.0.1:1235（代理，自动注入 reasoningBudget=500）→ http://127.0.0.1:1234（LM Studio）
+```
+
+### 7.3 效果
+
+| 场景 | 无代理 | 有代理（reasoningBudget=500） | 提升 |
+|---|---|---|---|
+| 简单问题（1+1=几） | 204 秒 | 5.7 秒 | **36 倍** |
+| 复杂代码（快速排序） | — | 8.5 秒 | — |
+| API 直连（简单问题） | 214 秒 | 0.67 秒 | **300 倍** |
+
+代码精度完好（快速排序函数正确输出）。
+
+### 7.4 部署
+
+```bash
+# 1. 复制代理脚本
+cp scripts/lmstudio-api-proxy.js ~/bin/
+
+# 2. 复制 LaunchAgent 配置
+cp scripts/com.user.lmstudio-api-proxy.plist ~/Library/LaunchAgents/
+
+# 3. 加载（开机自启 + 立即启动）
+launchctl load ~/Library/LaunchAgents/com.user.lmstudio-api-proxy.plist
+
+# 4. 把 CC-Switch / Claude Code 的端点改成 http://127.0.0.1:1235
+#    （CC-Switch 供应商配置里的 ANTHROPIC_BASE_URL）
+```
+
+### 7.5 调整思考预算
+
+编辑 `~/bin/lmstudio-api-proxy.js` 里的 `REASONING_BUDGET` 常量：
+- `200`：最快，简单任务足够
+- `500`（默认）：平衡速度与精度，复杂代码任务够用
+- `1000+`：复杂推理任务需要更多思考时
+
+修改后重启代理：`launchctl unload ~/Library/LaunchAgents/com.user.lmstudio-api-proxy.plist && launchctl load ~/Library/LaunchAgents/com.user.lmstudio-api-proxy.plist`
+
+### 7.6 已验证不可行的其他加速方案
+
+| 方案 | 结果 |
+|---|---|
+| MTP 投机解码（`--speculative-draft-mtp`） | ❌ unsloth 量化版无 MTP head |
+| 简单投机解码（额外 draft 模型） | ❌ 16GB 装不下两个模型 |
+| `--parallel 1`（单用户优化） | ❌ 导致 HTTP 000 不稳定 |
+| `--gpu max`（强制全 GPU） | ❌ 导致不稳定 |
+| settings.json 全局 `reasoningBudget` | ❌ 扁平键不被识别，需代理注入 |
+| KV cache 量化（q8_0） | ⚠️ 配置未生效（日志无 q8_0 信息），影响有限 |
 
 ---
 
